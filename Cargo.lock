@@ -1069,6 +1069,7 @@ dependencies = [
  "ic-verify-bls-signature",
  "js-sys",
  "k256",
+ "lazy_static",
  "leb128",
  "mockito",
  "p256",

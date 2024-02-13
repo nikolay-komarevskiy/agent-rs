@@ -1,14 +1,19 @@
 //! A [`Transport`] that connects using a [`reqwest`] client.
 #![cfg(feature = "reqwest")]
 
-use ic_transport_types::RejectResponse;
-pub use reqwest;
-
 use futures_util::StreamExt;
+use ic_transport_types::RejectResponse;
+use lazy_static::lazy_static;
+pub use reqwest;
 use reqwest::{
     header::{HeaderMap, CONTENT_TYPE},
     Body, Client, Method, Request, StatusCode,
 };
+use serde_cbor::Value;
+use std::fs::{File, OpenOptions};
+use std::io::{self, prelude::*};
+use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Mutex};
 
 use crate::{
     agent::{
@@ -20,6 +25,30 @@ use crate::{
     AgentError, RequestId,
 };
 
+struct GlobalFile {
+    file: Mutex<File>,
+}
+
+// Create a lazy static instance of the global file
+lazy_static! {
+    static ref GLOBAL_FILE: Arc<GlobalFile> = {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open("results.txt")
+            .unwrap();
+
+        Arc::new(GlobalFile {
+            file: Mutex::new(file),
+        })
+    };
+}
+
+fn write_to_global_file(tree: BTreeMap<&&str, i32>) {
+    let mut file = GLOBAL_FILE.file.lock().unwrap();
+    writeln!(file, "{:?}", tree).expect("Write failed");
+}
 /// A [`Transport`] using [`reqwest`] to make HTTP calls to the Internet Computer.
 #[derive(Debug)]
 pub struct ReqwestTransport {
@@ -139,6 +168,26 @@ impl ReqwestTransport {
         let headers = request_result.1;
         let body = request_result.2;
 
+        if let Some(timestamps) = headers.get("timestamps") {
+            let mut all_timestamps: Vec<_> = timestamps
+                .to_str()
+                .unwrap()
+                .split(", ")
+                .into_iter()
+                .collect();
+            let decoded_data: Value =
+                serde_cbor::from_reader(std::io::Cursor::new(body.clone().to_vec()))
+                    .expect("Failed to decode CBOR");
+            let own_timestamp = extract_timestamp(&decoded_data);
+            all_timestamps.push(own_timestamp.as_str());
+            let mut btree_map: BTreeMap<&&str, i32> = BTreeMap::new();
+            for value in all_timestamps.iter() {
+                let entry = btree_map.entry(value).or_insert(0);
+                *entry += 1;
+            }
+            write_to_global_file(btree_map);
+        }
+
         // status == OK means we have an error message for call requests
         // see https://internetcomputer.org/docs/current/references/ic-interface-spec#http-call
         if status == StatusCode::OK && endpoint.ends_with("call") {
@@ -163,6 +212,34 @@ impl ReqwestTransport {
         } else {
             Ok(body)
         }
+    }
+}
+
+fn extract_timestamp(value: &Value) -> String {
+    match value {
+        Value::Map(map) => {
+            let signatures = map
+                .get(&Value::Text("signatures".into()))
+                .expect("unexpected cbor body");
+            match signatures {
+                Value::Array(array) => match &array[0] {
+                    Value::Map(map) => {
+                        let value = map
+                            .get(&Value::Text("timestamp".to_string()))
+                            .expect("unexpected cbor body");
+                        match value {
+                            Value::Integer(integer_value) => {
+                                return integer_value.to_string();
+                            }
+                            _ => panic!("unexpected cbor body"),
+                        }
+                    }
+                    _ => panic!("unexpected cbor body"),
+                },
+                _ => panic!("unexpected cbor body"),
+            }
+        }
+        _ => panic!("unexpected cbor body"),
     }
 }
 
@@ -201,7 +278,7 @@ impl Transport for ReqwestTransport {
 
     fn query(&self, effective_canister_id: Principal, envelope: Vec<u8>) -> AgentFuture<Vec<u8>> {
         Box::pin(async move {
-            let endpoint = format!("canister/{effective_canister_id}/query");
+            let endpoint = format!("canister/{effective_canister_id}/certified_query");
             self.execute(Method::POST, &endpoint, Some(envelope)).await
         })
     }
